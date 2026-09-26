@@ -19,6 +19,49 @@ Pair-wise GSB 标注任务仓库（第 15 批 / 215）。
 ./mvnw -q verify
 ```
 
+## 实现说明
+
+代码位于 `src/main/java/com/example/gsb/replication/`：
+
+| 类 | 职责 |
+|----|------|
+| `VectorClock` | 向量时钟（逻辑时钟），`increment`/`merge`/`compare` |
+| `VersionRelation` | 版本比较结果：`BEFORE` / `AFTER` / `EQUAL` / `CONCURRENT` |
+| `VersionedField` | 单字段的一次写入：值 + 向量时钟 + 节点标识 + 物理时间戳 |
+| `VersionedRecord` | 一个键的字段集合，记录级时钟为各字段时钟的 join |
+| `ConflictResolver` | 冲突解决策略接口，可配置注入 |
+| `LastWriteWinsResolver` | 按物理时间戳取新（LWW） |
+| `NodePriorityResolver` | 按节点优先级取高 |
+| `ConflictRecord` | 冲突记录：保留值、被覆盖值、双方节点、策略与原因 |
+| `SyncStats` | 统计：同步轮次、冲突次数、按策略解决次数、保留的冲突记录数 |
+| `ReplicaNode` | 节点：`write` 本地写入，`syncWith` 两两双向同步 |
+
+### 冲突检测
+
+每次写入用节点自身的向量时钟递增后作为字段版本。两个版本比较时：
+逐分量全小于/全大于即为先后关系，直接取新；互有胜负即为并发冲突，
+交给策略裁决。
+
+### 无冲突合并
+
+记录级时钟并发时退到字段级合并：同一键的不同字段被不同节点修改时，
+各字段按自身版本取新后合并，而不是整记录覆盖；只有同一字段真正并发
+时才触发策略裁决并记录冲突。
+
+### 收敛性
+
+合并操作满足交换律、结合律、幂等性（join-semilattice），且策略对同一对
+输入的输出是确定性的，因此任意顺序、任意次数的同步后所有节点收敛到
+同一状态。`ConvergenceTest` 用多种随机同步顺序与两种策略验证了这一点。
+
+### LWW 策略的时钟风险
+
+`LastWriteWinsResolver` 依赖各节点物理时钟。多主环境下机器时钟存在漂移
+（clock skew），NTP 也只能把误差控制在有限范围内：当两次并发写入的时间
+间隔小于时钟误差时，"较新"的时间戳未必对应真实发生顺序，可能静默丢弃
+用户眼中更新的数据。对数据丢失敏感的场景应使用 `NodePriorityResolver`
+或应用层合并逻辑。
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
