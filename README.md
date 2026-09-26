@@ -19,6 +19,60 @@ Pair-wise GSB 标注任务仓库（第 15 批 / 215）。
 ./mvnw -q verify
 ```
 
+## 实现说明
+
+多主复制冲突检测与解决组件位于 `com.example.gsb.replica` 包，无任何第三方运行时依赖。
+
+### 核心设计
+
+| 类 | 职责 |
+|----|------|
+| `VectorClock` | 向量逻辑时钟，判定两个写入的因果关系：`BEFORE` / `AFTER` / `EQUAL` / `CONCURRENT`（冲突） |
+| `Version` | 版本元数据：向量时钟 + 节点标识 + 物理墙上时间戳（仅供 LWW 策略参考，不参与因果判断） |
+| `VersionedValue` | 带版本的字段值（不可变） |
+| `FieldEntry` | 单字段的兄弟版本集合调和：并集 → 剪除因果祖先 → 策略选优 |
+| `ConflictResolutionStrategy` | 冲突策略接口（可配置，实现须确定性） |
+| `TimestampWinsStrategy` | 策略一：按物理时间戳取新，时间戳相同按节点 id 字典序兜底 |
+| `NodePriorityStrategy` | 策略二：按节点优先级取高（集群一致的静态优先级表），相同按节点 id 兜底 |
+| `ReplicaNode` | 副本节点：本地写入、`syncFrom`/`syncWith` 字段级合并、收敛保证 |
+| `ConflictRecord` / `ConflictLog` | 冲突记录：保留键/字段、被覆盖值与版本、获胜值与版本、策略、原因、时间 |
+| `SyncStats` | 统计：同步轮次、冲突次数、无冲突字段合并次数、按策略解决次数、保留记录数 |
+
+### 字段级无冲突合并
+
+存储结构为 `key -> field -> FieldEntry`。两节点分别修改同一键的**不同字段**时直接合并
+（计入 `fieldMerges`），只有并发修改**同一字段**才走策略裁决。
+
+### 收敛性为什么成立
+
+`FieldEntry` 保留全部互不支配的并发原始版本（兄弟集合），而不是只留一个赢家。
+调和是集合运算——并集、按向量时钟剪除存在因果后继的版本、再在剩余集合上做确定性选优——
+满足**结合律、交换律、幂等律**，因此无论同步顺序（环型 / 星型 / 随机）与方向如何，
+最终所有节点状态一致；重复同步不会重复记录冲突。两种策略都用节点 id 做最终兜底，
+保证裁决结果确定且与同步方向无关。
+
+`ConvergenceTest` 以参数化方式覆盖两种策略 × 三种同步顺序，包含四节点并发改同一字段的
+最坏拓扑、不同字段合并、因果链更新，以及收敛后再次随机同步的幂等校验。
+
+### 按时间戳取新的时钟风险
+
+物理墙上时钟来自各节点本地系统时钟：存在时钟偏差/漂移，可能因 NTP 校时或人工修改而
+**回拨**，不保证单调、也没有全局一致保证。因此“时间戳更大”不等于逻辑更新，可能把
+语义更新的写入判输，造成静默丢失更新。本组件中时间戳**只用于并发版本之间的裁决**
+（因果先后始终由向量时钟保证），时间戳相等时按节点 id 兜底。对正确性敏感的场景应使用
+节点优先级策略，或部署单调时钟 / 混合逻辑时钟（HLC）。
+
+### 需求对照
+
+1. 版本元数据（逻辑时钟 + 节点标识）：`Version` / `VectorClock`
+2. 版本比较（先后 / 并发）：`VectorClock.relationTo`，测试见 `VectorClockComparisonTest`
+3. 两种可配置策略与时钟风险说明：`TimestampWinsStrategy`、`NodePriorityStrategy`
+4. 字段级无冲突合并：`FieldLevelMergeTest`
+5. 任意顺序收敛：`ConvergenceTest`
+6. 冲突记录（被覆盖值与原因）：`ConflictRecordAndStatsTest`
+7. 统计（轮次/冲突/按策略/保留记录）：`SyncStats` + `ConflictRecordAndStatsTest`
+8. `mvn -q verify` 一条命令通过（25 个测试）
+
 ## 任务提示词
 
 以下为本题完整的 User Prompt 原文，两次执行必须使用完全相同的文本。
